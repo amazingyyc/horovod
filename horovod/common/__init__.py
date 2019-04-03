@@ -152,3 +152,21 @@ class HorovodBasics(object):
             raise ValueError(
                 'Horovod has not been initialized; use hvd.init().')
         return bool(mpi_threads_supported)
+
+    def local_barrier(self):
+        '''a function to barrier all process'''
+        ret = self.MPI_LIB_CTYPES.horovod_local_barrier()
+
+        if ret < 0:
+            raise ValueError('Horovod has not been initialized(use hvd.init()) or local barrier get error (restart)')
+
+        return ret;
+
+    def barrier(self):
+        '''a function to barrier all process'''
+        ret = self.MPI_LIB_CTYPES.horovod_barrier()
+
+        if ret < 0:
+            raise ValueError('Horovod has not been initialized(use hvd.init()) or barrier get error (restart)')
+
+        return ret;

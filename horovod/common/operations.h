@@ -95,6 +95,19 @@ int horovod_local_size();
 // C interface to return flag indicating whether MPI multi-threading is
 // supported. Returns -1 if Horovod is not initialized.
 int horovod_mpi_threads_supported();
+
+/**add 2 function to sync between all the process*/
+
+/**
+ * sync the process in current host
+ * < 0 means not inited
+ * >= 0 means success
+ */
+int horovod_local_barrier();
+
+/**to sync all process*/
+int horovod_barrier();
+
 }
 
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,

@@ -127,7 +127,7 @@ struct HorovodGlobalState {
   std::thread background_thread;
 
   // Whether the background thread should shutdown.
-  std::atomic_bool shut_down {false};
+  std::atomic_bool shut_down{false};
 
   // Whether Horovod should finalize MPI (only if it has initialized it).
   bool should_finalize = false;
@@ -165,7 +165,7 @@ struct HorovodGlobalState {
       tensor_fusion_buffers;
 
   // Whether MPI_Init has been completed on the background thread.
-  std::atomic_bool initialization_done {false};
+  std::atomic_bool initialization_done{false};
 
   // The MPI rank, local rank, size, local size, flag indicating whether MPI
   // multi-threading is supported, ranks from which the MPI communicator will
@@ -1854,13 +1854,15 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
           while (!responses.empty()) {
             auto new_response = responses.front();
             assert(new_response.tensor_names().size() == 1);
-            auto& new_entry = state.tensor_table[new_response.tensor_names()[0]];
+            auto& new_entry =
+                state.tensor_table[new_response.tensor_names()[0]];
             int64_t new_tensor_size = new_entry.tensor->size();
 
             if (response.response_type() == new_response.response_type() &&
                 response.devices() == new_response.devices() &&
                 entry.tensor->dtype() == new_entry.tensor->dtype() &&
-                tensor_size + new_tensor_size <= state.tensor_fusion_threshold) {
+                tensor_size + new_tensor_size <=
+                    state.tensor_fusion_threshold) {
               // These tensors will fuse together well.
               tensor_size += new_tensor_size;
               response.add_tensor_names(new_response.tensor_names()[0]);
@@ -2024,6 +2026,42 @@ int horovod_mpi_threads_supported() {
     return -1;
   }
   return horovod_global.mpi_threads_supported ? 1 : 0;
+}
+
+/**sync the process in current host*/
+int horovod_local_barrier() {
+  if (!horovod_global.initialization_done) {
+    return -1;
+  }
+
+  /**barrier local process */
+  auto mpi_result = MPI_Barrier(horovod_global.local_comm);
+
+  if (MPI_SUCCESS != mpi_result) {
+    std::cerr << "barrier local process error, please restart" << std::endl;
+
+    return -1;
+  }
+
+  return 1;
+}
+
+/**to sync all process*/
+int horovod_barrier() {
+  if (!horovod_global.initialization_done) {
+    return -1;
+  }
+
+  /**barrier all process */
+  auto mpi_result = MPI_Barrier(horovod_global.mpi_comm);
+
+  if (MPI_SUCCESS != mpi_result) {
+    std::cerr << "barrier all process error, please restart" << std::endl;
+
+    return -1;
+  }
+
+  return 1;
 }
 }
 

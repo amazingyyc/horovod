@@ -46,7 +46,8 @@ local_size = _basics.local_size
 rank = _basics.rank
 local_rank = _basics.local_rank
 mpi_threads_supported = _basics.mpi_threads_supported
-
+local_barrier = _basics.local_barrier
+barrier = _basics.barrier
 
 # Schema: handle -> input, output
 # We keep input in order to make sure it does not get garbage collected

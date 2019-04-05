@@ -2143,6 +2143,8 @@ char* horovod_all_gather_str(const char* str_c) {
 
   std::string ret_str = ss.str();
 
+  std::cout << "the result of all gather string:" << ret_str << std::endl;
+
   char *ret_c = (char*)malloc(ret_str.size() + 1);
 
   ret_str.copy(ret_c, ret_str.size());

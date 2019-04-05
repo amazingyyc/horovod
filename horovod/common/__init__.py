@@ -188,14 +188,14 @@ class HorovodBasics(object):
         while start < length:
             end = start
 
-            while all_gather_str[end] is not '#' and end < length:
+            while end < length and all_gather_str[end] != '#':
                 end += 1
 
             count = int(all_gather_str[start:end])
 
             ret_str.append(all_gather_str[end+1:end+1+count])
 
-            start = end + 1
+            start = end + 1 + count
         
         return ret_str
 

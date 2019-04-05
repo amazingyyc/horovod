@@ -177,15 +177,11 @@ class HorovodBasics(object):
         self.MPI_LIB_CTYPES.restype  = ctypes.c_char_p
 
         str1 = str
-        str2 = str.encode('utf-8')
 
         ret1 = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str1))
-        ret2 = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str2))
 
         print "ret1:", ret1
-        print "ret1 decode:", ret1.decode()
-        print "ret2:", ret2
-        print "ret2 decode:", ret2.decode()
+        print "ret1 value:", ret1.value
 
 
 

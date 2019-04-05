@@ -2076,7 +2076,7 @@ char* horovod_all_gather_str(const char* str_c) {
 
   /**step 1: gather all str length from all process*/
   std::vector<int> all_str_length((size_t)horovod_global.size);
-  all_str_lens[horovod_global.rank] = (int)str.size();
+  all_str_length[horovod_global.rank] = (int)str.size();
 
   auto mpi_result = MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_str_length.data(), 1, MPI_INT, horovod_global.mpi_comm);
 

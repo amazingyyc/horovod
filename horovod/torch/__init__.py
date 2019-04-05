@@ -32,7 +32,7 @@ from horovod.torch.mpi_ops import allgather, allgather_async
 from horovod.torch.mpi_ops import broadcast, broadcast_async, broadcast_, broadcast_async_
 from horovod.torch.mpi_ops import poll, synchronize
 from horovod.torch.mpi_ops import init, shutdown
-from horovod.torch.mpi_ops import size, local_size, rank, local_rank, local_barrier, barrier
+from horovod.torch.mpi_ops import size, local_size, rank, local_rank, local_barrier, barrier, all_gather_str
 from horovod.torch.mpi_ops import mpi_threads_supported
 
 import torch

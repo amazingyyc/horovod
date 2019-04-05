@@ -69,6 +69,7 @@ local_rank = _basics.local_rank
 mpi_threads_supported = _basics.mpi_threads_supported
 local_barrier = _basics.local_barrier
 barrier = _basics.barrier
+all_gather_str = _basics.all_gather_str
 
 def _normalize_name(name):
     """Normalizes operation name to TensorFlow rules."""

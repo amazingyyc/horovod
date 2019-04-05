@@ -48,6 +48,7 @@ local_rank = _basics.local_rank
 mpi_threads_supported = _basics.mpi_threads_supported
 local_barrier = _basics.local_barrier
 barrier = _basics.barrier
+all_gather_str = _basics.all_gather_str
 
 # Schema: handle -> input, output
 # We keep input in order to make sure it does not get garbage collected

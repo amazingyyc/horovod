@@ -170,3 +170,19 @@ class HorovodBasics(object):
             raise ValueError('Horovod has not been initialized(use hvd.init()) or barrier get error (restart)')
 
         return ret;
+    
+    def all_gather_str(self, str):
+        '''a function to all gather a string'''
+        
+        # str_utf8 = str.encode('utf-8')
+
+        self.MPI_LIB_CTYPES.argtypes = [ctypes.c_char_p]
+        self.MPI_LIB_CTYPES.restype  = ctypes.c_char_p
+
+        gather_str = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str))
+
+        print gather_str
+
+
+
+

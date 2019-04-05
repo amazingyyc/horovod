@@ -108,6 +108,9 @@ int horovod_local_barrier();
 /**to sync all process*/
 int horovod_barrier();
 
+/**a function to gather string between all process*/
+char* horovod_all_gather_str(const char* str_c);
+
 }
 
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,

@@ -2063,6 +2063,97 @@ int horovod_barrier() {
 
   return 1;
 }
+
+/**a function to gather string between all process*/
+char* horovod_all_gather_str(const char* str_c) {
+  if (!horovod_global.initialization_done || nullptr == str_c) {
+    return nullptr;
+  }
+
+  std::string str(str_c);
+
+  std::cout << "rank ==> " << horovod_global.rank << " begin to all gather string: " << str << std::endl; 
+
+  /**step 1: gather all str length from all process*/
+  std::vector<int> all_str_length((size_t)horovod_global.size);
+  all_str_lens[horovod_global.rank] = (int)str.size();
+
+  auto mpi_result = MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_str_length.data(), 1, MPI_INT, horovod_global.mpi_comm);
+
+  if (MPI_SUCCESS != mpi_result) {
+    std::cerr << "all gather str:" << str << " get error, error code:" << mpi_result << std::endl;
+    return nullptr;
+  }
+
+  /**step 2: gather all str from all process*/
+  int total_length = 0;
+  for (auto i : all_str_length) {
+    total_length += i;
+  }
+
+  char* all_gather_str_c = (char*)malloc(total_length + 1);
+  int *recvcounts = (int*)malloc(sizeof(int) * horovod_global.size);
+  int *displs     = (int*)malloc(sizeof(int) * horovod_global.size);
+
+  for (int i = 0; i < horovod_global.size; ++i) {
+    recvcounts[i] = all_str_length[i];
+
+    if (0 == i) {
+      displs[i] = 0;
+    } else {
+      displs[i] = displs[i - 1] + recvcounts[i - 1];
+    }
+  }
+
+  mpi_result = MPI_Allgatherv(str.data(), (int)str.size(), MPI_CHAR, all_gather_str_c, recvcounts, displs, MPI_CHAR, horovod_global.mpi_comm);
+
+  if (MPI_SUCCESS != mpi_result) {
+    std::cerr << "all gather str:" << str << " get error, error code:" << mpi_result << std::endl;
+
+    free(displs);
+    free(recvcounts);
+    free(all_gather_str_c);
+
+    return nullptr;
+  }
+
+  all_gather_str_c[total_length] = '\0';
+
+  std::string all_gather_str(all_gather_str_c);
+
+  free(displs);
+  free(recvcounts);
+  free(all_gather_str_c);
+
+  /**
+   * step3 encode the string than we can decode it to a string array in python
+   * [a, bc] will encode to 1#a2#bc
+   */
+  std::stringstream ss;
+
+  int start = 0;
+
+  for (int i = 0; i < all_str_length.size(); ++i) {
+    std::string cur = all_gather_str.substr(start, all_str_length[i]);
+
+    ss << all_str_length[i] << "#" << cur;
+
+    start += all_str_length[i];
+  }
+
+  std::string ret_str = ss.str();
+
+  char *ret_c = (char*)malloc(ret_str.size() + 1);
+
+  ret_str.copy(ret_c, ret_str.size());
+
+  ret_c[ret_str.size()] = '\0';
+
+  return ret_c;
+}
+
+
+
 }
 
 // MPI must be initialized and the background thread must be running before

@@ -173,17 +173,32 @@ class HorovodBasics(object):
         if ret < 0:
             raise ValueError('Horovod has not been initialized(use hvd.init()) or barrier get error (restart)')
 
-        return ret;
+        return ret
     
     def all_gather_str(self, str):
         '''a function to all gather a string'''
+        all_gather_str = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str.encode('utf-8'))).decode()
+
+        '''decode the gather string to a array'''
+        ret_str = []
+
+        start = 0
+        length = len(all_gather_str)
+
+        while start < length:
+            end = start
+
+            while all_gather_str[end] is not '#' and end < length:
+                end += 1
+
+            count = int(all_gather_str[start:end])
+
+            ret_str.append(all_gather_str[end+1:end+1+count])
+
+            start = end + 1
         
-        str1 = str
+        return ret_str
 
-        ret1 = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str1))
-
-        print "ret1:", ret1
-        print "ret1 value:", ret1.value
 
 
 

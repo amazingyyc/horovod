@@ -54,6 +54,10 @@ class HorovodBasics(object):
     def __init__(self, pkg_path, *args):
         full_path = get_extension_full_path(pkg_path, *args)
         self.MPI_LIB_CTYPES = ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
+        
+        '''set horovod_all_gather_str "arg" and "res" type'''
+        self.MPI_LIB_CTYPES.horovod_all_gather_str.argtypes = [ctypes.c_char_p]
+        self.MPI_LIB_CTYPES.horovod_all_gather_str.restype  = ctypes.c_char_p
 
     def init(self, comm=None):
         """A function that initializes Horovod.
@@ -173,9 +177,7 @@ class HorovodBasics(object):
     
     def all_gather_str(self, str):
         '''a function to all gather a string'''
-        self.MPI_LIB_CTYPES.argtypes = [ctypes.c_char_p]
-        self.MPI_LIB_CTYPES.restype  = ctypes.c_char_p
-
+        
         str1 = str
 
         ret1 = self.MPI_LIB_CTYPES.horovod_all_gather_str(ctypes.c_char_p(str1))

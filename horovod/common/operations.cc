@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <unordered_map>
 #include <unordered_set>
+#include <condition_variable>
 
 #if HAVE_CUDA
 #include <cuda_runtime.h>
@@ -178,14 +179,12 @@ struct SingleSequenceThreadQueue: public SingleThreadQueue {
 
 	template <class F, class... Args>
   void enqueue(int64_t seq, F&& f, Args&&... args) {
-    while (seq != sequence.load()) {
-      /**loop to wait*/
-    }
+    while (seq != sequence.load()) {}
+  
+		SingleThreadQueue::enqueue(f, args...);
 
     /**increase 1*/
     sequence++;
-
-		SingleThreadQueue::enqueue(f, args);
 	}
 };
 
@@ -356,8 +355,8 @@ struct HorovodGlobalState {
   int hierarchical_thread_count = 2;
 
   /**multi-thread use to hierarchical alreduce*/
-  std::vector<cudaStream_t> hierarchical_cuda_steams;
   std::vector<ncclComm_t> hierarchical_nccl_comms;
+  std::vector<cudaStream_t> hierarchical_cuda_steams;
 
   std::vector<SingleThreadQueue> hierarchical_threads;
 
@@ -849,6 +848,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
   }
 
 
+#if defined(HAVE_CUDA) && defined(HAVE_NCCL)
 /**nccl_comm created by main thread that can be guaranted the thread has the same ncclComm_t*/
 void hierarchical_allreduce_nccl(
                 int thread_idx,
@@ -862,7 +862,8 @@ void hierarchical_allreduce_nccl(
 
   std::cout << "yyc thread:" << thread_idx << " begin to allreduce seq:" << seq << std::endl;
 
-	auto& firest_entry = entries[0];
+	auto& first_entry = entries[0];
+  auto& timeline = global_state.timeline;
 
 	int size = global_state.size;
 	int local_size = global_state.local_size;
@@ -958,17 +959,18 @@ void hierarchical_allreduce_nccl(
 	 */
 	auto mpi_data_type = GetMPIDataType(first_entry.tensor);
 	auto mpi_op = first_entry.tensor->dtype() == HOROVOD_FLOAT16 ? global_state.mpi_float16_sum : MPI_SUM;
+  auto &cross_comm = global_state.cross_comm;
 
   std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " begin use CPU to do allreduce in another thread" << std::endl;
 
 	ThreadBarrier barrier(1);
 
-	global_state.hierarchical_mpi_thread.enqueue(seq, [&barrier, host_buffer, num_elements_per_rank, mpi_data_type, mpi_op, &cross_comm]() {
+	global_state.hierarchical_mpi_thread.enqueue(seq, [seq, &barrier, &timeline, &entries, host_buffer, fusion_elements_count_per_rank, mpi_data_type, mpi_op, &cross_comm]() {
     std::cout << "seq:" << seq << " begin in MPI thread to do all reduce" << std::endl;
 
 		MPI_CHECK(entries, "MPI_Allreduce", MPI_Allreduce(MPI_IN_PLACE,
 													host_buffer,
-													(int)num_elements_per_rank,
+													(int)fusion_elements_count_per_rank,
 													mpi_data_type,
 													mpi_op,
 													cross_comm));
@@ -1020,7 +1022,7 @@ void hierarchical_allreduce_nccl(
 	free(host_buffer);
 
 	/**free GPU memory, this function is synchronous so do not need to wait any GPU event*/
-	CUDA_CHECK(entries, "cudaFree", cudaFree(fusion_buffer);
+	CUDA_CHECK(entries, "cudaFree", cudaFree(fusion_buffer));
 
 	for (auto& item : entries) {
 		item.callback(Status::OK());
@@ -1028,6 +1030,7 @@ void hierarchical_allreduce_nccl(
 
   std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " free memory and call the tensor callback and resturn" << std::endl;
 }
+#endif
 
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
 // raising an error.
@@ -1229,7 +1232,8 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
         std::cout << "yyc finish init hierarchical_nccl_comms" << std::endl;
 
         /**create thread*/
-        horovod_global.hierarchical_threads.resize(horovod_global.hierarchical_thread_count);
+        // horovod_global.hierarchical_threads.resize(horovod_global.hierarchical_thread_count);
+        horovod_global.hierarchical_threads = std::move(std::vector<SingleThreadQueue>(horovod_global.hierarchical_thread_count));
 
         horovod_global.hierarchical_allreduce_seq = 0;
         horovod_global.hierarchical_initialize = true;
@@ -1249,7 +1253,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
       std::cout << "yyc put seq:" << horovod_global.hierarchical_allreduce_seq << " into thread:" << thread_idx << std::endl;
 
-      horovod_global.hierarchical_threads[idx].enqueue([thread_idx, seq, &horovod_global, entries]() {
+      horovod_global.hierarchical_threads[thread_idx].enqueue([thread_idx, seq, &horovod_global, entries]() {
         hierarchical_allreduce_nccl(thread_idx,
                                     seq, 
                                     horovod_global, 

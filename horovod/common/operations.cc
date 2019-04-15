@@ -76,14 +76,18 @@ namespace common {
 
 namespace {
 
-/**add some thread struct*/
+/**thread barrier is a struct use to wait task finish in another thread*/
 struct ThreadBarrier {
     std::atomic<int64_t> barrier;
 
     ThreadBarrier(int64_t count) : barrier(count) {
-        if (count <= 0) {
+        if (count = 0) {
             throw std::runtime_error("count must be > 0");
         }
+    }
+
+    void add() {
+      barrier++;
     }
 
     void notify() {
@@ -168,24 +172,6 @@ struct SingleThreadQueue {
     cond_var.notify_all();
     worker.join();
   }
-};
-
-/**all task must have a squence and have to matched*/
-struct SingleSequenceThreadQueue: public SingleThreadQueue {
-	std::atomic<int64_t> sequence;
-
-	SingleSequenceThreadQueue(): SingleThreadQueue(), sequence(0) {
-	}
-
-	template <class F, class... Args>
-  void enqueue(int64_t seq, F&& f, Args&&... args) {
-    while (seq != sequence.load()) {}
-  
-		SingleThreadQueue::enqueue(f, args...);
-
-    /**increase 1*/
-    sequence++;
-	}
 };
 
 // Table storing Tensors to be reduced, keyed by unique name.
@@ -278,6 +264,10 @@ struct HorovodGlobalState {
                      std::shared_ptr<PersistentBuffer>>
       tensor_fusion_buffers;
 
+  /***same with tensor_fusion_buffers, but used for end_thread*/
+  std::unordered_map<std::tuple<int, Framework>, std::shared_ptr<PersistentBuffer>>
+      end_tensor_fusion_buffers;
+
   // Whether MPI_Init has been completed on the background thread.
   std::atomic_bool initialization_done{false};
 
@@ -330,9 +320,15 @@ struct HorovodGlobalState {
 // TensorFlow stream, and must use our own stream.
 #if HAVE_CUDA
   std::unordered_map<int, cudaStream_t> streams;
+
+  /**same with streams, but ending_streams is used in end_thread for doing GPU operator*/
+  std::unordered_map<int, cudaStream_t> end_streams;
 #endif
 #if HAVE_NCCL
   std::unordered_map<std::vector<int32_t>, ncclComm_t> nccl_comms;
+
+  /**same with nccl_comms, but use for end_thread*/
+  std::unordered_map<std::vector<int32_t>, ncclComm_t> end_nccl_comms;
 #endif
 
   // Will be set to true after initialization when ddl is used
@@ -347,28 +343,27 @@ struct HorovodGlobalState {
 #endif
 
   /**
-   * for hierarchical allreduce use the multi-thread,
-   * every thread will bind with a unique cudaStream_t and ncclComm_t
-   * but they all use the same mpi_comm
+   * for hierarchical allreduce use 3 thread to do the allreduce job
+   * thread 1: main thread (the background_thread), the reducescatter and copy data from GPU to CPU is running in this thread
+   * thread 2: MPI thread, the MPI allreduce will running in this,
+   * thread 3: GPU thread, copy data back to GPU and reducegather will running in this thread 
+   * 
+   * the hierarchical allreduce will split to 3 steps:
+   * step1: in GPU do reducescater and copy data from GPU to CPU
+   * step2: in CPU do allreduce using MPI
+   * step3: in GPU do copy data from CPU tp GPU and reducegather than copy back to output tensor
+   * 
+   * for multi-thread allreduce, it will malloc 2 GPU fusion buffer and multi-CPU buffer.
+   * GPU-buffer1 will use in background_thread for step1
+   * after step1 it will malloc a CPU buffer for mpi_thread to do step2
+   * sfter step2 the CPU buffer wil copy to GPU-buffer2 than do step3 in end_thread
    */
-#if defined(HAVE_CUDA) && defined(HAVE_NCCL)
-  int hierarchical_thread_count = 2;
+  
+  /**in this thread the MPI use the cross_comm to communicate with other process*/
+  SingleThreadQueue mpi_thread;
 
-  /**multi-thread use to hierarchical alreduce*/
-  std::vector<ncclComm_t> hierarchical_nccl_comms;
-  std::vector<cudaStream_t> hierarchical_cuda_steams;
-
-  std::vector<SingleThreadQueue> hierarchical_threads;
-
-  /**all mpi in hierarchical alreduce in the same thread and use the same cross_comm*/
-  SingleSequenceThreadQueue hierarchical_mpi_thread;
-
-  /**the sequence of all reduce*/
-  int64_t hierarchical_allreduce_seq;
-
-  /**if the thread or nccl comm have been initialize*/
-  std::atomic_bool hierarchical_initialize{false};
-#endif
+  /**for hierarchical allreduce, in this thread will do: copy data back to GPU memory and reduce gather*/
+  SingleThreadQueue end_thread;
 
   ~HorovodGlobalState() {
     // Make sure that the destructor of the background thread is safe to
@@ -849,187 +844,389 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
 
 
 #if defined(HAVE_CUDA) && defined(HAVE_NCCL)
-/**nccl_comm created by main thread that can be guaranted the thread has the same ncclComm_t*/
-void hierarchical_allreduce_nccl(
-                int thread_idx,
-                int64_t seq,
-								HorovodGlobalState& global_state, 
-								ncclComm_t &nccl_comm, 
-								cudaStream_t &cuda_stream,
-								std::vector<TensorTableEntry> entries) {
-	assert(!entries.empty());
-	assert(CPU_DEVICE_ID != entries[0].device);
 
-  std::cout << "yyc thread:" << thread_idx << " begin to allreduce seq:" << seq << std::endl;
+/**
+ * the hierarchical allreduce have 3 steps
+ * step 1 is running on background_thread
+ */
+void hierarchical_homogeneous_allreduce_step1();
+void hierarchical_homogeneous_allreduce_step2();
+void hierarchical_homogeneous_allreduce_step3();
 
-	auto& first_entry = entries[0];
-  auto& timeline = global_state.timeline;
+void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, MPIResponse &response, std::vector<TensorTableEntry> &entries) {
+  assert(!entries.empty());
+  assert(CPU_DEVICE_ID != entries[0].device);
 
-	int size = global_state.size;
-	int local_size = global_state.local_size;
-	int cross_size = global_state.cross_size;
+  auto &timeline    = global_state.timeline;
+  auto &first_entry = entries[0];
 
-	int rank = global_state.rank;
-	int local_rank = global_state.local_rank;
-	int cross_rank = global_state.cross_rank;
+  /**
+   * the stream, end_stream, buffer, end_buffer, nccl_comm, end_nccl_comm
+   * will be create in main thread(background_thread) 
+   * than it can be easy to handle the resource
+   */
 
-	int element_size;
-	MPI_Type_size(GetMPIDataType(first_entry.tensor), &element_size);
+  /**set the GPU device*/
+  CUDA_CHECK(entries, "cudaSetDevice", cudaSetDevice(first_entry.device));
 
-	assert(0 == FUSION_BUFFER_ATOMIC_UNIT % element_size);
+  cudaStream_t& stream     = global_state.streams[first_entry.device];
+  cudaStream_t& end_stream = global_state.end_streams[first_entry.device];
 
-	int64_t elements_count = 0;
-	int64_t bytes_count = 0;
+  if (nullptr == stream || nullptr == end_stream) {
+    int greatest_priority;
 
-	for (auto &item : entries) {
-		elements_count += item.tensor->shape().num_elements();
-		bytes_count    += item.tensor->size();
-	}
+    CUDA_CHECK(entries, "cudaDeviceGetStreamPriorityRange", 
+                          cudaDeviceGetStreamPriorityRange(NULL, &greatest_priority));
 
-	assert(elements_count > 0);
-	assert(bytes_count > 0);
-	
-	/**
-	 * malloc GPU buffer to do reduce
-	 * make the fusion_buffer can be divisible by local_size and FUSION_BUFFER_ATOMIC_UNIT
-	 * than when split to reduce scatter it can be improve performance
-	 * the FUSION_BUFFER_ATOMIC_UNIT is 64 so it always can be divisible by element_size
-	 */
-	int64_t div = local_size * FUSION_BUFFER_ATOMIC_UNIT;
-	int64_t fusion_elements_count = ((elements_count + div - 1) / div) * div;
-	int64_t fusion_buffer_size    = fusion_elements_count * element_size;
+    if (nullptr == stream) {
+      CUDA_CHECK(entries, "cudaStreamCreateWithPriority", 
+                          cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest_priority));
+    }
+    
+    if (nullptr == end_stream) {
+      CUDA_CHECK(entries, "cudaStreamCreateWithPriority", 
+                          cudaStreamCreateWithPriority(&end_stream, cudaStreamNonBlocking, greatest_priority));
+    }
+  }
 
-	assert(fusion_elements_count > 0)
-	assert(0 == fusion_buffer_size % element_size && fusion_buffer_size > 0);
+  /**create nccl_comm, end_nccl_comm*/
+  std::vector<int32_t> nccl_device_map;
+  for (int rank : global_state.local_comm_ranks) {
+    nccl_device_map.push_back(response.devices()[rank]);
+  }
 
-	/**malloc memory*/
-	void* fusion_buffer = nullptr;
+  ncclComm_t& nccl_comm = global_state.nccl_comms[nccl_device_map];
+  ncclComm_t& end_nccl_comm = global_state.end_nccl_comms[nccl_device_map];
 
-	CUDA_CHECK(entries, "cudaMalloc", cudaMalloc(&fusion_buffer, (size_t)fusion_buffer_size));
+  if (nullptr == nccl_comm || nullptr == end_nccl_comm) {
+    if (nullptr == nccl_comm) {
+      // ACTIVITY_START_ALL(entries, timeline, INIT_NCCL);
 
-	/**copy memory to fusion_buffer*/
-	int64_t offset = 0;
-	for (auto &item : entries) {
-		void* fusion_buffer_offset = (uint8_t*)fusion_buffer + offset;
+      int nccl_rank = global_state.local_rank;
+      int nccl_size = global_state.local_size;
+      MPI_Comm nccl_id_bcast_comm = global_state.local_comm;  
 
-		CUDA_CHECK(entries, "cudaMemcpyAsync", cudaMemcpyAsync(fusion_buffer_offset, 
-														item.tensor->data(), 
-														(size_t)item.tensor->size(), 
-														cudaMemcpyDeviceToDevice, 
-														cuda_stream));
+      ncclUniqueId nccl_id;
+      if (nccl_rank == 0) {
+        NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
+      }
 
-		offset += item.tensor->size();
-	}
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, nccl_id_bcast_comm));
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " finish copy data to fusion buffer" << std::endl;
+      // ACTIVITY_END_ALL(entries, timeline);
+    }
 
-	int64_t fusion_elements_count_per_rank = fusion_elements_count / local_size;
-	int64_t fusion_buffer_size_per_rank    = fusion_elements_count_per_rank * element_size;
-	void* fusion_buffer_offset_per_rank     = (uint8_t*)fusion_buffer + fusion_buffer_size_per_rank * local_rank;
+    if (nullptr == end_nccl_comm) {
+      // ACTIVITY_START_ALL(entries, timeline, INIT_END_NCCL);
 
-	/**star to do reduce scatter on GPU*/
-	NCCL_CHECK(entries, "ncclReduceScatter", ncclReduceScatter(
-											fusion_buffer,
-											fusion_buffer_offset_per_rank,
-											(size_t)fusion_elements_count_per_rank,
-											GetNCCLDataType(first_entry.tensor),
-											ncclSum,
-											nccl_comm,
-											cuda_stream));
+      int end_nccl_rank = global_state.local_rank;
+      int end_nccl_size = global_state.local_size;
+      MPI_Comm end_nccl_id_bcast_comm = global_state.local_comm;
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " async do ncclReduceScatter" << std::endl;
+      ncclUniqueId end_nccl_id;
+      if (end_nccl_rank == 0) {
+        NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&end_nccl_id))
+      }
 
-	/**
-	 * for now the fusion_buffer have contain the reduceScatter'data
-	 * now should copy the GPU memory to CPU
-	 */
-	void* host_buffer = malloc(fusion_buffer_size_per_rank);
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&end_nccl_id, sizeof(end_nccl_id), MPI_BYTE, 0, end_nccl_id_bcast_comm));
 
-	CUDA_CHECK(entries, "cudaMemcpyAsync", cudaMemcpyAsync(host_buffer,
-									fusion_buffer_offset_per_rank,
-									fusion_buffer_size_per_rank,
-									cudaMemcpyDeviceToHost,
-									cuda_stream));
+      // ACTIVITY_END_ALL(entries, timeline);
+    }
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " async copy data to CPU" << std::endl;
+    /**sync all process*/
+    MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(global_state.mpi_comm));
+  }
 
-	/**
-	 * now should begin to all reduce use MPI
-	 * for do the all reduce one by one, should put the operation in a sequence queue
-	 */
-	auto mpi_data_type = GetMPIDataType(first_entry.tensor);
-	auto mpi_op = first_entry.tensor->dtype() == HOROVOD_FLOAT16 ? global_state.mpi_float16_sum : MPI_SUM;
-  auto &cross_comm = global_state.cross_comm;
+  /**this operator maybe not needed*/
+  /**
+  if (timeline.Initialized()) {
+    RECORD_EVENT(entries, event_queue, QUEUE, stream)
+  }
+  */
+  /**
+   * for entries.size() > 1, the input_buffer and output_buffer is same is fusion_buffer
+   * but for entries.size() == 1, it will not use the fusion buffer, the input_buffer is same with tensor's memory
+   * the output_bufer is same with tensor output memory
+   */
+  const void *input_buffer;
+  void *output_buffer;
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " begin use CPU to do allreduce in another thread" << std::endl;
+  size_t buffer_len;
 
-	ThreadBarrier barrier(1);
+  int64_t total_num_elements = 0;
+  
+  /**the element bytes bandwidth*/
+  int element_size;
+  MPI_Type_size(GetMPIDataType(first_entry.tensor), &element_size);
 
-	global_state.hierarchical_mpi_thread.enqueue(seq, [seq, &barrier, &timeline, &entries, host_buffer, fusion_elements_count_per_rank, mpi_data_type, mpi_op, &cross_comm]() {
-    std::cout << "seq:" << seq << " begin in MPI thread to do all reduce" << std::endl;
+  if (entries.size() > 1) {
+    auto &fusion_buffer = horovod_global.tensor_fusion_buffers[std::make_tuple(first_entry.device, first_entry.context->framework())];
 
-		MPI_CHECK(entries, "MPI_Allreduce", MPI_Allreduce(MPI_IN_PLACE,
-													host_buffer,
-													(int)fusion_elements_count_per_rank,
-													mpi_data_type,
-													mpi_op,
-													cross_comm));
-		
-		barrier.notify();
+    output_buffer = const_cast<void*>(fusion_buffer->AccessData(first_entry.context));
 
-    std::cout << "seq:" << seq << " finish all reduce" << std::endl;
-	});
+    int64_t offset = 0;
 
-	/**wait finish*/
-	barrier.wait();
+    /**copy tensor data to output buffer*/
+    for (auto &e : entries) {
+      total_num_elements += e.tensor->shape().num_elements();
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " finish CPU to do allreduce" << std::endl;
+      void *output_buffer_at_offset = (uint8_t*)output_buffer + offset;
 
-	/**wait finish MPI all reduce than begin copy data to GPU*/
-	CUDA_CHECK(entries, "cudaMemcpyAsync", cudaMemcpyAsync(fusion_buffer_offset_per_rank,
-														host_buffer,
-														fusion_buffer_size_per_rank, 
-														cudaMemcpyHostToDevice,
-														cuda_stream));
-	
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " async copy data to GPU" << std::endl;
+      CUDA_CHECK(entries, "cudaMemcpyAsync",
+                          cudaMemcpyAsync(output_buffer_at_offset, 
+                                          e.tensor->data(),
+                                          (size_t)e.tensor->size(),
+                                          cudaMemcpyDeviceToDevice, 
+                                          stream));
+      
+      offset += e.tensor->size();
+    }
 
-	/**do ncclAllGather*/
-	NCCL_CHECK(entries, "ncclAllGather", ncclAllGather(fusion_buffer_offset_per_rank,
-														fusion_buffer,
-														(size_t)fusion_elements_count_per_rank,
-														GetNCCLDataType(first_entry.tensor),
-														nccl_comm,
-														cuda_stream));
-	
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " async ncclAllGather in GPU" << std::endl;
+    buffer_len = (size_t)offset;
 
-	/**now copy data back to output tensor*/
-	offset = 0;
-	for (auto& item : entries) {
-		void* fusion_buffer_offset = (uint8_t*)fusion_buffer + offset;
+    input_buffer = output_buffer;
+  } else {
+    input_buffer  = first_entry.tensor->data();
+    output_buffer = (void*)first_entry.output->data();
 
-		CUDA_CHECK(entries, "cudaMemcpyAsync", cudaMemcpyAsync((void*)item.output->data(),
-										fusion_buffer_offset,
-										(size_t)item.tensor->size(),
-										cudaMemcpyDeviceToDevice,
-										cuda_stream));
-	}
+    total_num_elements = first_entry.tensor->shape().num_elements();
+    buffer_len         = (size_t)first_entry.output->size();
+  }
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " wait GPU finish copy data out of fusion" << std::endl;  
+  /**
+   * if use the fusion buffer, 
+   * it will make the num_elements can be divisible by local_size * FUSION_BUFFER_ATOMIC_UNIT to improve performance
+   */
+  if (entries.size() > 1) {
+    int div = global_state.local_size * FUSION_BUFFER_ATOMIC_UNIT;
+    total_num_elements = ((total_num_elements + div - 1) / div) * div;
+    buffer_len         = total_num_elements * element_size;
+  }
 
-	/**free host memory*/
-	free(host_buffer);
+  /**split the buffer to global_state.local_size*/
+  int64_t num_elements_per_rank = total_num_elements / global_state.local_size;
 
-	/**free GPU memory, this function is synchronous so do not need to wait any GPU event*/
-	CUDA_CHECK(entries, "cudaFree", cudaFree(fusion_buffer));
+  /**if the num_elements_per_rank > 0 means we will use the nccl to reducescater*/
+  if (num_elements_per_rank > 0) {
+    size_t buffer_len_per_rank = element_size * num_elements_per_rank;
 
-	for (auto& item : entries) {
-		item.callback(Status::OK());
-	}
+    void *output_buffer_per_rank = (uint8_t*)output_buffer + global_state.local_rank * buffer_len_per_rank;
 
-  std::cout << "yyc thread:" << thread_idx << " seq:" << seq << " free memory and call the tensor callback and resturn" << std::endl;
+    NCCL_CHECK(entries, "ncclReduceScatter",
+                     ncclReduceScatter(input_buffer,
+                                       output_buffer_per_rank,
+                                       (size_t)num_elements_per_rank,
+                                       GetNCCLDataType(first_entry.tensor),
+                                       ncclSum,
+                                       nccl_comm, 
+                                       stream));
+  }
+
+  /**the last rank should reduce the ramaining data*/
+  int64_t num_elements_remain = total_num_elements % global_state.local_size;
+
+  if (num_elements_remain > 0) {
+    int last_rank = global_state.local_size - 1;
+
+    size_t remain_offset = (size_t)(num_elements_per_rank * element_size * global_state.local_size);
+
+    void *input_ramain_buffer  = (uint8_t*)input_buffer + remain_offset;
+    void *output_ramain_buffer = (uint8_t*)output_buffer + remain_offset;
+
+    NCCL_CHECK(entries, "ncclReduce",
+                     ncclReduce(input_ramain_buffer,
+                                output_ramain_buffer,
+                                (size_t)num_elements_remain,
+                                GetNCCLDataType(first_entry.tensor), 
+                                ncclSum,
+                                last_rank, 
+                                nccl_comm, 
+                                stream));
+  }
+
+  /**for now all data have been reduce to output_buffer*/
+  bool is_last_rank = (global_state.local_size - 1 == global_state.local_rank);
+
+  int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
+  int64_t real_buffer_len   = real_num_elements * element_size;
+
+  /**the memory point of the real GPU data for this rank*/
+  void *output_buffer_per_rank = (uint8_t*)output_buffer + global_state.local_rank * element_size * num_elements_per_rank;
+
+  /**
+   * copy data from GPU to CPU
+   * the host memor will be free in end_thread
+   */
+  void *host_buffer = malloc(real_buffer_len);
+
+  /**
+   * copy memory from GPU to host is sync, 
+   * so do not need to sync by hand
+   */
+  // ACTIVITY_START_ALL(entries, timeline, MEMCPY_IN_HOST_BUFFER);
+  CUDA_CHECK(entries, "cudaMemcpyAsync",
+                     cudaMemcpyAsync(host_buffer, 
+                                     output_buffer_per_rank,
+                                     real_buffer_len, 
+                                     cudaMemcpyDeviceToHost,
+                                     stream));
+  // ACTIVITY_END_ALL(entries, timeline);
+  
+  /**
+   * for now the reduce data of one host have been copy to CPU meory, and now need use the MPI_thread to do allreduce
+   * for thread safe, it will get all needed resource like end_nccl_comm, cross_comm, host buffer pointer, end_fusion_buffer_pointer at the main thread
+   */
+  void *gpu_buffer = nullptr;
+
+  if (entries.size() > 1) {
+    auto &end_fusion_buffer = horovod_global.end_tensor_fusion_buffers[std::make_tuple(first_entry.device, first_entry.context->framework())];
+
+    gpu_buffer = const_cast<void*>(end_fusion_buffer->AccessData(first_entry.context));
+  } else {
+    gpu_buffer = (void*)first_entry.output->data();
+  }
+  
+  /**the MPI allreduce will run the mpi_thread*/
+  global_state.mpi_thread.enqueue([&global_state, entries, host_buffer, gpu_buffer, end_stream, end_nccl_comm, num_elements_per_rank, num_elements_remain, element_size]() {
+    hierarchical_homogeneous_allreduce_step2(global_state, 
+                                            entries, 
+                                            host_buffer, 
+                                            gpu_buffer, 
+                                            end_stream, 
+                                            end_nccl_comm, 
+                                            num_elements_per_rank, 
+                                            num_elements_remain, 
+                                            element_size);
+  });
 }
+
+void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state, 
+                                              std::vector<TensorTableEntry> &entries, 
+                                              void *host_buffer, 
+                                              void *gpu_buffer,
+                                              cudaStream_t end_stream,
+                                              ncclComm_t end_nccl_comm,
+                                              int64_t num_elements_per_rank,
+                                              int64_t num_elements_remain,
+                                              int element_size) {
+  auto &timeline = global_state.timeline;
+  auto &first_entry = entries[0];
+
+  bool is_last_rank = (global_state.local_size - 1 == global_state.local_rank);
+  int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
+
+  // ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE);
+  MPI_CHECK(entries, "MPI_Allreduce",
+                    MPI_Allreduce(MPI_IN_PLACE, 
+                                  host_buffer,
+                                  (int)real_num_elements,
+                                  GetMPIDataType(first_entry.tensor),
+                                  first_entry.tensor->dtype() == HOROVOD_FLOAT16 ? global_state.mpi_float16_sum : MPI_SUM,
+                                  global_state.cross_comm));
+  // ACTIVITY_END_ALL(entries, timeline);
+
+  /**finish MPI allreduce than should do step3 in end_thread*/
+  global_state.end_thread.enqueue([&global_state, entries, host_buffer, gpu_buffer, end_stream, end_nccl_comm, num_elements_per_rank, num_elements_remain, element_size] {
+    hierarchical_homogeneous_allreduce_step3(global_state, 
+                                            entries, 
+                                            host_buffer, 
+                                            gpu_buffer, 
+                                            end_stream, 
+                                            end_nccl_comm, 
+                                            num_elements_per_rank, 
+                                            num_elements_remain, 
+                                            element_size);
+  });
+}
+
+/**
+ * host_buffer: the buffer in CPU that has the allreduce result
+ * gpu_buffer: if entries.size() > 1, the gpu_buffer is end_buffer, if not it will be same with the first_tensor's output 
+ */ 
+void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state, 
+                                              std::vector<TensorTableEntry> &entries,
+                                              void *host_buffer,
+                                              void *gpu_buffer,
+                                              cudaStream_t end_stream,
+                                              ncclComm_t end_nccl_comm,
+                                              int64_t num_elements_per_rank,
+                                              int64_t num_elements_remain,
+                                              int element_size) {
+  auto &timeline = global_state.timeline;
+  auto &first_entry = entries[0];
+
+  bool is_last_rank = global_state.local_size - 1 == global_state.local_rank;
+  
+  int64_t real_num_elements = is_last_rank ? num_elements_per_rank + num_elements_remain : num_elements_per_rank;
+  int64_t real_buffer_len = real_num_elements * element_size;
+
+  /**copy data from CPU to GPU and release the host memory*/
+  void *gpu_buffer_offset = (uint8_t*)gpu_buffer + global_state.local_rank * num_elements_per_rank * element_size;
+
+  //ACTIVITY_START_ALL(entries, timeline, MEMCPY_OUT_HOST_BUFFER)
+  CUDA_CHECK(entries, "cudaMemcpyAsync",
+              cudaMemcpyAsync(gpu_buffer_offset, 
+                              host_buffer,
+                              real_buffer_len, 
+                              cudaMemcpyHostToDevice,
+                              end_stream));
+  //ACTIVITY_END_ALL(entries, timeline)
+
+  /**after cpy data back to GPU, should free the host memory*/
+  free(host_buffer);
+
+  if (num_elements_per_rank > 0) {
+    NCCL_CHECK(entries, "ncclAllGather",
+                     ncclAllGather( gpu_buffer_offset, 
+                                    gpu_buffer,
+                                    (size_t)num_elements_per_rank,
+                                    GetNCCLDataType(first_entry.tensor),
+                                    end_nccl_comm, 
+                                    end_stream));
+  }
+
+  if (num_elements_remain > 0) {
+    int last_rank = global_state.local_size - 1;
+
+    void *gpu_buffer_remain = (uint8_t*)gpu_buffer + global_state.local_size * num_elements_per_rank * element_size;
+
+    NCCL_CHECK(entries, "ncclBcast",
+            ncclBcast(gpu_buffer_remain,
+                      (size_t)num_elements_remain,
+                      GetNCCLDataType(first_entry.tensor), 
+                      last_rank,
+                      end_nccl_comm,
+                      end_stream));
+  }
+
+  /**now the gpu_buffer have all the result, if entries.size() > 1 should copy back to tensor output*/
+  if (entriex.size() > 1) {
+    int64_t offset = 0;
+
+    for (auto &e : entries) {
+      void* gpu_buffer_offset = (uint8_t*)gpu_buffer + offset;
+
+      CUDA_CHECK(entries, "cudaMemcpyAsync",
+                     cudaMemcpyAsync((void*)e.output->data(),
+                                     gpu_buffer_offset,
+                                     (size_t)e.tensor->size(),
+                                     cudaMemcpyDeviceToDevice, 
+                                     end_stream));
+      
+      offset += e.tensor->size();
+    }
+  }
+
+  /**wait the end_stream finish and call the tensor callback*/
+  CUDA_CHECK(entries, "cudaStreamSynchronize", cudaStreamSynchronize(end_stream));
+
+  for (auto &e : entries) {
+    timeline.End(e.tensor_name, e.output);
+    e.callback(Status::OK());
+  }
+} 
+
+
 #endif
 
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
@@ -1087,6 +1284,27 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
       ACTIVITY_END_ALL(entries, timeline)
     }
+    
+    /**at here init the end_buffer for end_thread*/
+    auto &end_buffer = horovod_global.end_tensor_fusion_buffers[std::make_tuple(
+        first_entry.device, first_entry.context->framework())];
+
+    if (nullptr == end_buffer) {
+      ACTIVITY_START_ALL(entries, timeline, INIT_END_FUSION_BUFFER);
+
+      Status status = first_entry.context->AllocatePersistent(
+          horovod_global.tensor_fusion_threshold, &end_buffer);
+        
+      if (!status.ok()) {
+        for (auto& e : entries) {
+          timeline.End(e.tensor_name, nullptr);
+          e.callback(status);
+        }
+        return;
+      }
+
+      ACTIVITY_END_ALL(entries, timeline);
+    }
   }
 
   // On GPU data readiness is signalled by ready_event.
@@ -1118,7 +1336,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
   Status status;
   if (response.response_type() == MPIResponse::ALLGATHER) {
     assert(entries.size() == 1);
-    auto e = entries[0];
+    auto e = entries[0]; 
 
     // Copy tensor sizes from the MPI response into a vector of int64_t
     // and compute total size.  This is size of first dimension.
@@ -1182,92 +1400,14 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     auto& first_entry = entries[0];
 
 #if defined(HAVE_CUDA) && defined(HAVE_NCCL) && HOROVOD_GPU_ALLREDUCE == 'N'
-    /**use multi thread to do all reduce*/
-    if (first_entry.device != CPU_DEVICE_ID) {
-      if (false == horovod_global.hierarchical_initialize) {
-        /**
-         * for now use 2 thread to do the job
-         * create 2 stream
-         */
-        std::cout << "yyc begin to init multi-thread for hierarchical all reduce" << std::endl;
-
-        horovod_global.hierarchical_cuda_steams.resize(horovod_global.hierarchical_thread_count);
-        horovod_global.hierarchical_nccl_comms.resize(horovod_global.hierarchical_thread_count);
-
-        int greatest_priority;
-        CUDA_CHECK(entries, "cudaDeviceGetStreamPriorityRange",
-                   cudaDeviceGetStreamPriorityRange(NULL, &greatest_priority));
-
-        for (int i = 0; i < horovod_global.hierarchical_cuda_steams.size(); ++i) {
-          CUDA_CHECK(entries, "cudaStreamCreateWithPriority",
-                   cudaStreamCreateWithPriority(&horovod_global.hierarchical_cuda_steams[i], 
-                                                cudaStreamNonBlocking,
-                                                greatest_priority));
-        }
-
-        std::cout << "yyc finish init hierarchical_cuda_steams" << std::endl;
-
-        /**create 2 nccl comm*/
-        int nccl_rank = horovod_global.local_rank;
-        int nccl_size = horovod_global.local_size;
-
-        for (int i = 0; i < horovod_global.hierarchical_nccl_comms.size(); ++i) {
-          ncclUniqueId nccl_id;
-          if (nccl_rank == 0) {
-            NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
-          }
-
-          MPI_CHECK(entries, "MPI_Bcast",
-                  MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
-                            horovod_global.local_comm));
-          
-          ncclComm_t new_nccl_comm;
-          NCCL_CHECK(
-              entries, "ncclCommInitRank",
-              ncclCommInitRank(&new_nccl_comm, nccl_size, nccl_id, nccl_rank));
-          
-          horovod_global.hierarchical_nccl_comms[i] = new_nccl_comm;
-        }
-
-        std::cout << "yyc finish init hierarchical_nccl_comms" << std::endl;
-
-        /**create thread*/
-        // horovod_global.hierarchical_threads.resize(horovod_global.hierarchical_thread_count);
-        horovod_global.hierarchical_threads = std::move(std::vector<SingleThreadQueue>(horovod_global.hierarchical_thread_count));
-
-        horovod_global.hierarchical_allreduce_seq = 0;
-        horovod_global.hierarchical_initialize = true;
-
-        std::cout << "yyc finish init threads" << std::endl;
-
-        /**barrier for all process*/
-        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(horovod_global.mpi_comm));
-
-        std::cout << "yyc all process finished" << std::endl;
-      }
-
-      /**get the thread index*/
-      int thread_idx = horovod_global.hierarchical_allreduce_seq % horovod_global.hierarchical_thread_count;
-
-      int64_t seq = horovod_global.hierarchical_allreduce_seq;
-
-      std::cout << "yyc put seq:" << horovod_global.hierarchical_allreduce_seq << " into thread:" << thread_idx << std::endl;
-
-      horovod_global.hierarchical_threads[thread_idx].enqueue([thread_idx, seq, &horovod_global, entries]() {
-        hierarchical_allreduce_nccl(thread_idx,
-                                    seq, 
-                                    horovod_global, 
-                                    horovod_global.hierarchical_nccl_comms[thread_idx],
-                                    horovod_global.hierarchical_cuda_steams[thread_idx],
-                                    entries);
-      });
-
-      horovod_global.hierarchical_allreduce_seq++;
-
+    if (CPU_DEVICE_ID != first_entry.device && horovod_global.is_homogeneous) {
+      /**
+       * multi-thread do the homogeneous allreduce
+       */
+      hierarchical_homogeneous_allreduce_step1(horovod_global, response, entries);
       return;
-    }
+    } 
 #endif
-
 
 #if HAVE_CUDA
     bool on_gpu = first_entry.device != CPU_DEVICE_ID;

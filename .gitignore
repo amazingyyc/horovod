@@ -5,3 +5,4 @@ horovod.egg-info
 dist
 build
 .vs/
+.vscode/

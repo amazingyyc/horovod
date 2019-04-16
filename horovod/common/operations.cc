@@ -853,7 +853,9 @@ void hierarchical_homogeneous_allreduce_step1();
 void hierarchical_homogeneous_allreduce_step2();
 void hierarchical_homogeneous_allreduce_step3();
 
-void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, MPIResponse &response, std::vector<TensorTableEntry> &entries) {
+void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
+                                              MPIResponse &response, 
+                                              std::vector<TensorTableEntry> &entries) {
   assert(!entries.empty());
   assert(CPU_DEVICE_ID != entries[0].device);
 
@@ -904,14 +906,13 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
 
       int nccl_rank = global_state.local_rank;
       int nccl_size = global_state.local_size;
-      MPI_Comm nccl_id_bcast_comm = global_state.local_comm;  
 
       ncclUniqueId nccl_id;
       if (nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
       }
 
-      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, nccl_id_bcast_comm));
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, global_state.local_comm));
 
       // ACTIVITY_END_ALL(entries, timeline);
     }
@@ -921,14 +922,13 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
 
       int end_nccl_rank = global_state.local_rank;
       int end_nccl_size = global_state.local_size;
-      MPI_Comm end_nccl_id_bcast_comm = global_state.local_comm;
 
       ncclUniqueId end_nccl_id;
       if (end_nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&end_nccl_id))
       }
 
-      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&end_nccl_id, sizeof(end_nccl_id), MPI_BYTE, 0, end_nccl_id_bcast_comm));
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&end_nccl_id, sizeof(end_nccl_id), MPI_BYTE, 0, global_state.local_comm));
 
       // ACTIVITY_END_ALL(entries, timeline);
     }
@@ -999,6 +999,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
    */
   if (entries.size() > 1) {
     int div = global_state.local_size * FUSION_BUFFER_ATOMIC_UNIT;
+
     total_num_elements = ((total_num_elements + div - 1) / div) * div;
     buffer_len         = total_num_elements * element_size;
   }
@@ -1006,7 +1007,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
   /**split the buffer to global_state.local_size*/
   int64_t num_elements_per_rank = total_num_elements / global_state.local_size;
 
-  /**if the num_elements_per_rank > 0 means we will use the nccl to reducescater*/
+  /**if the num_elements_per_rank > 0 means we will use the nccl to ncclReduceScatter*/
   if (num_elements_per_rank > 0) {
     size_t buffer_len_per_rank = element_size * num_elements_per_rank;
 
@@ -1030,7 +1031,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
 
     size_t remain_offset = (size_t)(num_elements_per_rank * element_size * global_state.local_size);
 
-    void *input_ramain_buffer  = (uint8_t*)input_buffer + remain_offset;
+    void *input_ramain_buffer  = (uint8_t*)input_buffer  + remain_offset;
     void *output_ramain_buffer = (uint8_t*)output_buffer + remain_offset;
 
     NCCL_CHECK(entries, "ncclReduce",
@@ -1087,7 +1088,16 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
   }
   
   /**the MPI allreduce will run the mpi_thread*/
-  global_state.mpi_thread.enqueue([&global_state, entries, host_buffer, gpu_buffer, end_stream, end_nccl_comm, num_elements_per_rank, num_elements_remain, element_size]() {
+  global_state.mpi_thread.enqueue([&global_state, 
+                                  entries, 
+                                  host_buffer, 
+                                  gpu_buffer, 
+                                  end_stream, 
+                                  end_nccl_comm, 
+                                  num_elements_per_rank,
+                                  num_elements_remain, 
+                                  element_size]() {
+
     hierarchical_homogeneous_allreduce_step2(global_state, 
                                             entries, 
                                             host_buffer, 
@@ -1109,10 +1119,11 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
                                               int64_t num_elements_per_rank,
                                               int64_t num_elements_remain,
                                               int element_size) {
-  auto &timeline = global_state.timeline;
+  auto &timeline    = global_state.timeline;
   auto &first_entry = entries[0];
 
   bool is_last_rank = (global_state.local_size - 1 == global_state.local_rank);
+
   int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
 
   // ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE);
@@ -1126,7 +1137,16 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
   // ACTIVITY_END_ALL(entries, timeline);
 
   /**finish MPI allreduce than should do step3 in end_thread*/
-  global_state.end_thread.enqueue([&global_state, entries, host_buffer, gpu_buffer, end_stream, end_nccl_comm, num_elements_per_rank, num_elements_remain, element_size] {
+  global_state.end_thread.enqueue([&global_state, 
+                                  entries, 
+                                  host_buffer, 
+                                  gpu_buffer, 
+                                  end_stream, 
+                                  end_nccl_comm, 
+                                  num_elements_per_rank, 
+                                  num_elements_remain, 
+                                  element_size] {
+
     hierarchical_homogeneous_allreduce_step3(global_state, 
                                             entries, 
                                             host_buffer, 
@@ -1155,10 +1175,10 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
   auto &timeline = global_state.timeline;
   auto &first_entry = entries[0];
 
-  bool is_last_rank = global_state.local_size - 1 == global_state.local_rank;
+  bool is_last_rank = (global_state.local_size - 1 == global_state.local_rank);
   
-  int64_t real_num_elements = is_last_rank ? num_elements_per_rank + num_elements_remain : num_elements_per_rank;
-  int64_t real_buffer_len = real_num_elements * element_size;
+  int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
+  int64_t real_buffer_len   = real_num_elements * element_size;
 
   /**copy data from CPU to GPU and release the host memory*/
   void *gpu_buffer_offset = (uint8_t*)gpu_buffer + global_state.local_rank * num_elements_per_rank * element_size;
@@ -1172,7 +1192,7 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
                               end_stream));
   //ACTIVITY_END_ALL(entries, timeline)
 
-  /**after cpy data back to GPU, should free the host memory*/
+  /**after copy data back to GPU, should free the host memory*/
   free(host_buffer);
 
   if (num_elements_per_rank > 0) {
@@ -1224,8 +1244,7 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
     timeline.End(e.tensor_name, e.output);
     e.callback(Status::OK());
   }
-} 
-
+}
 
 #endif
 
@@ -1400,10 +1419,14 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     auto& first_entry = entries[0];
 
 #if defined(HAVE_CUDA) && defined(HAVE_NCCL) && HOROVOD_GPU_ALLREDUCE == 'N'
-    if (CPU_DEVICE_ID != first_entry.device && horovod_global.is_homogeneous) {
-      /**
-       * multi-thread do the homogeneous allreduce
-       */
+    /**
+     * when use hierarchical_allreduce and is_homogeneous is true and the local_size > 1
+     * it will use the multi-thread to do the allreduce
+     */
+    if (CPU_DEVICE_ID != first_entry.device && 
+        horovod_global.hierarchical_allreduce && 
+        horovod_global.is_homogeneous && 
+        horovod_global.local_size > 1) {
       hierarchical_homogeneous_allreduce_step1(horovod_global, response, entries);
       return;
     } 

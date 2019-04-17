@@ -901,18 +901,23 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
   ncclComm_t& end_nccl_comm = global_state.end_nccl_comms[nccl_device_map];
 
   if (nullptr == nccl_comm || nullptr == end_nccl_comm) {
+    int nccl_rank = global_state.local_rank;
+    int nccl_size = global_state.local_size;
+      
+    MPI_Comm mpi_local_comm = global_state.local_comm;
+
     if (nullptr == nccl_comm) {
       // ACTIVITY_START_ALL(entries, timeline, INIT_NCCL);
-
-      int nccl_rank = global_state.local_rank;
-      int nccl_size = global_state.local_size;
 
       ncclUniqueId nccl_id;
       if (nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
       }
 
-      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, global_state.local_comm));
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, mpi_local_comm));
+
+      NCCL_CHECK(entries, "ncclCommInitRank",
+            ncclCommInitRank(&nccl_comm, nccl_size, nccl_id, nccl_rank));
 
       // ACTIVITY_END_ALL(entries, timeline);
     }
@@ -920,15 +925,15 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
     if (nullptr == end_nccl_comm) {
       // ACTIVITY_START_ALL(entries, timeline, INIT_END_NCCL);
 
-      int end_nccl_rank = global_state.local_rank;
-      int end_nccl_size = global_state.local_size;
-
       ncclUniqueId end_nccl_id;
       if (end_nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&end_nccl_id))
       }
 
-      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&end_nccl_id, sizeof(end_nccl_id), MPI_BYTE, 0, global_state.local_comm));
+      MPI_CHECK(entries, "MPI_Bcast", MPI_Bcast((void*)&end_nccl_id, sizeof(end_nccl_id), MPI_BYTE, 0, mpi_local_comm));
+
+      NCCL_CHECK(entries, "ncclCommInitRank",
+            ncclCommInitRank(&end_nccl_comm, nccl_size, end_nccl_id, nccl_rank));
 
       // ACTIVITY_END_ALL(entries, timeline);
     }

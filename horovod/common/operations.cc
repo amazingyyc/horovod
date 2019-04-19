@@ -849,9 +849,29 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
  * the hierarchical allreduce have 3 steps
  * step 1 is running on background_thread
  */
-void hierarchical_homogeneous_allreduce_step1();
-void hierarchical_homogeneous_allreduce_step2();
-void hierarchical_homogeneous_allreduce_step3();
+void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
+                                              MPIResponse &response, 
+                                              std::vector<TensorTableEntry> &entries);
+
+void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state, 
+                                              std::vector<TensorTableEntry> &entries, 
+                                              void *host_buffer, 
+                                              void *gpu_buffer,
+                                              cudaStream_t end_stream,
+                                              ncclComm_t end_nccl_comm,
+                                              int64_t num_elements_per_rank,
+                                              int64_t num_elements_remain,
+                                              int element_size);
+
+void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state, 
+                                              std::vector<TensorTableEntry> &entries,
+                                              void *host_buffer,
+                                              void *gpu_buffer,
+                                              cudaStream_t end_stream,
+                                              ncclComm_t end_nccl_comm,
+                                              int64_t num_elements_per_rank,
+                                              int64_t num_elements_remain,
+                                              int element_size);
 
 void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state, 
                                               MPIResponse &response, 
@@ -926,7 +946,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
       // ACTIVITY_START_ALL(entries, timeline, INIT_END_NCCL);
 
       ncclUniqueId end_nccl_id;
-      if (end_nccl_rank == 0) {
+      if (nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&end_nccl_id))
       }
 
@@ -1225,7 +1245,7 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
   }
 
   /**now the gpu_buffer have all the result, if entries.size() > 1 should copy back to tensor output*/
-  if (entriex.size() > 1) {
+  if (entries.size() > 1) {
     int64_t offset = 0;
 
     for (auto &e : entries) {

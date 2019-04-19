@@ -854,7 +854,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
                                               std::vector<TensorTableEntry> &entries);
 
 void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state, 
-                                              std::vector<TensorTableEntry> &entries, 
+                                              std::vector<TensorTableEntry> entries, 
                                               void *host_buffer, 
                                               void *gpu_buffer,
                                               cudaStream_t end_stream,
@@ -864,7 +864,7 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
                                               int element_size);
 
 void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state, 
-                                              std::vector<TensorTableEntry> &entries,
+                                              std::vector<TensorTableEntry> entries,
                                               void *host_buffer,
                                               void *gpu_buffer,
                                               cudaStream_t end_stream,
@@ -1136,7 +1136,7 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
 }
 
 void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state, 
-                                              std::vector<TensorTableEntry> &entries, 
+                                              std::vector<TensorTableEntry> entries, 
                                               void *host_buffer, 
                                               void *gpu_buffer,
                                               cudaStream_t end_stream,
@@ -1189,7 +1189,7 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
  * gpu_buffer: if entries.size() > 1, the gpu_buffer is end_buffer, if not it will be same with the first_tensor's output 
  */ 
 void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state, 
-                                              std::vector<TensorTableEntry> &entries,
+                                              std::vector<TensorTableEntry> entries,
                                               void *host_buffer,
                                               void *gpu_buffer,
                                               cudaStream_t end_stream,

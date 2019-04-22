@@ -927,8 +927,6 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
     MPI_Comm mpi_local_comm = global_state.local_comm;
 
     if (nullptr == nccl_comm) {
-      // ACTIVITY_START_ALL(entries, timeline, INIT_NCCL);
-
       ncclUniqueId nccl_id;
       if (nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
@@ -938,13 +936,9 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
 
       NCCL_CHECK(entries, "ncclCommInitRank",
             ncclCommInitRank(&nccl_comm, nccl_size, nccl_id, nccl_rank));
-
-      // ACTIVITY_END_ALL(entries, timeline);
     }
 
     if (nullptr == end_nccl_comm) {
-      // ACTIVITY_START_ALL(entries, timeline, INIT_END_NCCL);
-
       ncclUniqueId end_nccl_id;
       if (nccl_rank == 0) {
         NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&end_nccl_id))
@@ -954,20 +948,12 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
 
       NCCL_CHECK(entries, "ncclCommInitRank",
             ncclCommInitRank(&end_nccl_comm, nccl_size, end_nccl_id, nccl_rank));
-
-      // ACTIVITY_END_ALL(entries, timeline);
     }
 
     /**sync all process*/
     MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(global_state.mpi_comm));
   }
 
-  /**this operator maybe not needed*/
-  /**
-  if (timeline.Initialized()) {
-    RECORD_EVENT(entries, event_queue, QUEUE, stream)
-  }
-  */
   /**
    * for entries.size() > 1, the input_buffer and output_buffer is same is fusion_buffer
    * but for entries.size() == 1, it will not use the fusion buffer, the input_buffer is same with tensor's memory
@@ -1089,14 +1075,12 @@ void hierarchical_homogeneous_allreduce_step1(HorovodGlobalState &global_state,
    * copy memory from GPU to host is sync, 
    * so do not need to sync by hand
    */
-  // ACTIVITY_START_ALL(entries, timeline, MEMCPY_IN_HOST_BUFFER);
   CUDA_CHECK(entries, "cudaMemcpyAsync",
                      cudaMemcpyAsync(host_buffer, 
                                      output_buffer_per_rank,
                                      real_buffer_len, 
                                      cudaMemcpyDeviceToHost,
                                      stream));
-  // ACTIVITY_END_ALL(entries, timeline);
   
   /**
    * for now the reduce data of one host have been copy to CPU meory, and now need use the MPI_thread to do allreduce
@@ -1151,7 +1135,6 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
 
   int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
 
-  // ACTIVITY_START_ALL(entries, timeline, MPI_ALLREDUCE);
   MPI_CHECK(entries, "MPI_Allreduce",
                     MPI_Allreduce(MPI_IN_PLACE, 
                                   host_buffer,
@@ -1159,7 +1142,6 @@ void hierarchical_homogeneous_allreduce_step2(HorovodGlobalState &global_state,
                                   GetMPIDataType(first_entry.tensor),
                                   first_entry.tensor->dtype() == HOROVOD_FLOAT16 ? global_state.mpi_float16_sum : MPI_SUM,
                                   global_state.cross_comm));
-  // ACTIVITY_END_ALL(entries, timeline);
 
   /**finish MPI allreduce than should do step3 in end_thread*/
   global_state.end_thread.enqueue([&global_state, 
@@ -1200,6 +1182,8 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
   auto &timeline = global_state.timeline;
   auto &first_entry = entries[0];
 
+
+
   bool is_last_rank = (global_state.local_size - 1 == global_state.local_rank);
   
   int64_t real_num_elements = is_last_rank ? (num_elements_per_rank + num_elements_remain) : num_elements_per_rank;
@@ -1208,14 +1192,15 @@ void hierarchical_homogeneous_allreduce_step3(HorovodGlobalState &global_state,
   /**copy data from CPU to GPU and release the host memory*/
   void *gpu_buffer_offset = (uint8_t*)gpu_buffer + global_state.local_rank * num_elements_per_rank * element_size;
 
-  //ACTIVITY_START_ALL(entries, timeline, MEMCPY_OUT_HOST_BUFFER)
+  /**set the GPU device*/
+  CUDA_CHECK(entries, "cudaSetDevice", cudaSetDevice(first_entry.device));
+
   CUDA_CHECK(entries, "cudaMemcpyAsync",
               cudaMemcpyAsync(gpu_buffer_offset, 
                               host_buffer,
                               real_buffer_len, 
                               cudaMemcpyHostToDevice,
                               end_stream));
-  //ACTIVITY_END_ALL(entries, timeline)
 
   /**after copy data back to GPU, should free the host memory*/
   free(host_buffer);

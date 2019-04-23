@@ -324,6 +324,7 @@ struct HorovodGlobalState {
   /**same with streams, but ending_streams is used in end_thread for doing GPU operator*/
   std::unordered_map<int, cudaStream_t> end_streams;
 #endif
+
 #if HAVE_NCCL
   std::unordered_map<std::vector<int32_t>, ncclComm_t> nccl_comms;
 
@@ -365,12 +366,17 @@ struct HorovodGlobalState {
   /**for hierarchical allreduce, in this thread will do: copy data back to GPU memory and reduce gather*/
   SingleThreadQueue end_thread;
 
-  ~HorovodGlobalState() {
+  ~HorovodGlobalState() {    
     // Make sure that the destructor of the background thread is safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
     if (background_thread.joinable()) {
       shut_down = true;
+
+      /**wait mpi and end thread to stop*/
+      mpi_thread.stop();
+      end_thread.stop();
+
       background_thread.join();
     }
   }

@@ -41,6 +41,9 @@ using MessageTable = std::unordered_map<
 // background thread responsible for all MPI operations, and communicate with
 // that background thread through global state.
 struct HorovodGlobalState {
+  std::string test_name;
+  int64_t test_count = 0;
+
   // An atomic boolean which is set to true when background thread is started.
   // This ensures that only one background thread is spawned.
   std::atomic_flag initialize_flag = ATOMIC_FLAG_INIT;

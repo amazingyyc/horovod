@@ -1437,10 +1437,12 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
     horovod_global.test_name = name;
   }
 
-  std::cout << "=======================================================================" << std::endl;
-  std::cout << "yyc the test_name tensor:" << horovod_global.test_name << ", all reduce count:" << horovod_global.test_count << std::endl;
-  std::cout << "=======================================================================" << std::endl;
-  horovod_global.test_count += 1;
+  if (horovod_global.test_name == name) {
+    std::cout << "=======================================================================" << std::endl;
+    std::cout << "yyc the test_name tensor:" << horovod_global.test_name << ", all reduce count:" << horovod_global.test_count << std::endl;
+    std::cout << "=======================================================================" << std::endl;
+    horovod_global.test_count += 1;
+  }
 
   Request message;
   message.set_request_rank(horovod_global.rank);
